@@ -1,6 +1,6 @@
 # Commander of the Day Discord Bot
 
-A Python Discord bot that posts one random Commander-legal Magic: The Gathering card every day at **13:00 Europe/Berlin**. Card data and artwork are fetched from Scryfall.
+A Python Discord bot that posts one random Commander-legal Magic: The Gathering card every day at **6:00 Europe/Berlin**. Card data and artwork are fetched from Scryfall.
 
 Your public website domain is hard-coded in `bot.py`:
 `https://mj1cx6qutv.apps.bot-hosting.cloud`
