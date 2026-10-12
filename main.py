@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 from datetime import time as datetime_time
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -9,6 +10,7 @@ from zoneinfo import ZoneInfo
 import aiohttp
 import discord
 from aiohttp import web
+from discord import app_commands
 from discord.ext import commands, tasks
 
 # ---- Configuration ----
@@ -16,7 +18,7 @@ from discord.ext import commands, tasks
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN", "").strip()
 CHANNEL_ID = int(os.getenv("CHANNEL_ID") or os.getenv("DISCORD_CHANNEL_ID") or "0")
 TIMEZONE = os.getenv("TIMEZONE", "Europe/Berlin")
-POST_HOUR = int(os.getenv("POST_HOUR", "13"))
+POST_HOUR = int(os.getenv("POST_HOUR", "6"))
 POST_MINUTE = int(os.getenv("POST_MINUTE", "0"))
 
 # Your Bot-Hosting.net public domain is intentionally hard-coded here.
@@ -26,6 +28,64 @@ SCRYFALL_RANDOM_URL = "https://api.scryfall.com/cards/random"
 SCRYFALL_QUERY = "is:commander legal:commander"
 USER_AGENT = "CommanderOfTheDayDiscordBot/1.0 (contact: configure-your-bot)"
 STATE_FILE = Path("bot_state.json")
+
+# All five MTG colours plus colourless, in Scryfall's canonical order.
+#   W = White   U = Blue   B = Black   R = Red   G = Green   C = Colorless
+COLOR_CODE_RE = re.compile(r"\{([^{}]*)\}")
+COLOR_ORDER = "wubrgc"
+VALID_COLORS = set(COLOR_ORDER)
+
+
+def parse_color_identity(value: str) -> str:
+    """Turn '{U}', '{W}{U}' or '{u}{b}' into Scryfall's colour code 'wu'.
+
+    Braces are required, as in Scryfall's own notation, and every code holds
+    exactly one of W U B R G C. Anything else raises ValueError so the command
+    can tell the user what it expected.
+
+    The result is always returned in canonical WUBRGC order regardless of the
+    order the user typed the symbols in, e.g. '{U}{W}' -> 'wu'.
+    """
+    raw = value.strip()
+    if not raw:
+        raise ValueError("empty")
+
+    codes = COLOR_CODE_RE.findall(raw)
+    leftover = COLOR_CODE_RE.sub("", raw).strip(" \t,/+-&")
+    if not codes or leftover:
+        raise ValueError(raw)
+
+    letters: list[str] = []
+    seen: set[str] = set()
+    for code in codes:
+        letter = code.strip().lower()
+        if len(letter) != 1 or letter not in VALID_COLORS:
+            raise ValueError("{" + code.strip() + "}")
+        if letter not in seen:
+            letters.append(letter)
+            seen.add(letter)
+
+    return "".join(char for char in COLOR_ORDER if char in seen)
+
+
+def build_query(color: str | None = None, creature_type: str | None = None) -> str:
+    """Combine the base Commander query with the optional filters.
+
+    Colours match the exact colour identity (id=), so '{W}{U}' finds only
+    commanders whose colour identity is precisely white+blue (Azorius), while
+    '{B}' finds only mono-black commanders. '{C}' finds colourless commanders.
+
+    All five MTG colours are supported: {W} {U} {B} {R} {G}, plus {C} for
+    colourless. They can be freely combined, e.g. '{W}{U}{B}' for Esper.
+    """
+    query = SCRYFALL_QUERY
+    if color and color.strip():
+        query += f" id={parse_color_identity(color)}"
+    if creature_type and creature_type.strip():
+        cleaned = creature_type.strip().replace('"', "")
+        if cleaned:
+            query += f' t:"{cleaned}"'
+    return query
 
 logging.basicConfig(
     level=logging.INFO,
@@ -61,19 +121,20 @@ def save_state() -> None:
     )
 
 
-async def fetch_commander() -> dict:
+async def fetch_commander(query: str | None = None) -> dict:
     """Fetch a random Commander-legal commander from Scryfall."""
     assert http_session is not None
     headers = {
         "User-Agent": USER_AGENT,
         "Accept": "application/json",
     }
+    scryfall_query = query or SCRYFALL_QUERY
 
     # Try a few times to avoid posting the same card on consecutive days.
     for _ in range(5):
         async with http_session.get(
             SCRYFALL_RANDOM_URL,
-            params={"q": SCRYFALL_QUERY},
+            params={"q": scryfall_query},
             headers=headers,
             timeout=aiohttp.ClientTimeout(total=20),
         ) as response:
@@ -194,18 +255,51 @@ async def on_ready() -> None:
 
 @bot.command(name="commander")
 @commands.guild_only()
-async def commander_now(ctx: commands.Context) -> None:
-    """Manually post a Commander of the Day."""
+async def commander_now(
+    ctx: commands.Context,
+    color: str | None = None,
+    creature_type: str | None = None,
+) -> None:
+    """Manually post a Commander of the Day, e.g. !commander {W}{U} Elf."""
+    try:
+        query = build_query(color, creature_type)
+    except ValueError as exc:
+        await ctx.send(
+            f"`{exc}` is not a colour code. Use Scryfall notation in braces, "
+            "like {U} for blue, {W}{U} for Azorius or {C} for colorless. "
+            "All five colours are supported: {W} {U} {B} {R} {G}, plus {C} for colorless."
+        )
+        return
+
     await ctx.typing()
     try:
-        card = await fetch_commander()
+        card = await fetch_commander(query)
         await ctx.send(embed=make_embed(card))
+    except aiohttp.ClientResponseError as exc:
+        if exc.status == 404:
+            await ctx.send(
+                "No commander matches those filters. Try a broader colour or creature type."
+            )
+        else:
+            log.exception("!commander could not fetch a card from Scryfall.")
+            await ctx.send("Sorry, I couldn't retrieve a card from Scryfall right now.")
     except (aiohttp.ClientError, asyncio.TimeoutError, RuntimeError):
         await ctx.send("Sorry, I couldn't retrieve a card from Scryfall right now.")
 
 
-@bot.tree.command(name="commander", description="Post a random Commander of the Day")
-async def commander_slash(interaction: discord.Interaction) -> None:
+@bot.tree.command(
+    name="commander",
+    description="Post a random Commander of the Day, optionally filtered by colour and creature type",
+)
+@app_commands.describe(
+    color="Colour identity in Scryfall braces, e.g. {U}, {W}{U}, {B}{R}{G}, {C}",
+    creature_type="Creature type to filter by, e.g. Elf, Dragon",
+)
+async def commander_slash(
+    interaction: discord.Interaction,
+    color: str | None = None,
+    creature_type: str | None = None,
+) -> None:
     """Slash-command version of !commander.
 
     Works with the default intents, so it does not depend on the
@@ -213,7 +307,17 @@ async def commander_slash(interaction: discord.Interaction) -> None:
     """
     await interaction.response.defer()
     try:
-        card = await fetch_commander()
+        query = build_query(color, creature_type)
+    except ValueError as exc:
+        await interaction.followup.send(
+            f"`{exc}` is not a colour code. Use Scryfall notation in braces, "
+            "like {U} for blue, {W}{U} for Azorius or {C} for colorless. "
+            "All five colours are supported: {W} {U} {B} {R} {G}, plus {C} for colorless."
+        )
+        return
+
+    try:
+        card = await fetch_commander(query)
     except (aiohttp.ClientError, asyncio.TimeoutError, RuntimeError):
         log.exception("Slash command could not fetch a card from Scryfall.")
         await interaction.followup.send(
